@@ -103,3 +103,56 @@ def test_missing_peer_traps_instead_of_hanging() -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("needs 2 GPUs with CUDA IPC")
     multi_process_parallel(2, _missing_peer_worker, timeout_s=20 * _TIMEOUT_S)
+
+
+def _missing_peer_graph_worker(world_size: int, rank: int, port: int) -> None:
+    # Same missing-peer case as _missing_peer_worker, but the waiting call is a
+    # captured CUDA graph replay: no host-side code runs while the kernel
+    # spins, so only the in-kernel deadline can end it.
+    os.environ["FLASHINFER_PCIE_IPC_TIMEOUT_S"] = str(_TIMEOUT_S)
+    import flashinfer.comm as comm
+
+    _init_process_group(world_size, rank, port)
+    group = dist.group.WORLD
+    device = torch.device(f"cuda:{rank}")
+    ws = comm.PcieIpcAllReduceWorkspace(
+        group=group, max_numel=4096, dtype=torch.bfloat16
+    )
+    inp = torch.ones(1, 4096, dtype=torch.bfloat16, device=device)
+    # Warm the tuner and bind the workspace on one stream: the first call is a
+    # real, eager call, so the process-group autotune collective runs here and
+    # not under capture. A workspace serves one stream, so every eager call
+    # must stay on this one stream.
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ws.all_reduce(inp)
+    torch.cuda.current_stream().wait_stream(stream)
+    dist.barrier(group=group)
+    # Capture the next call. Replays carry no host-side call, so the binding
+    # above still governs; what the replay runs is the kernel alone, waiting
+    # for the peer's next flag - exactly the wait the deadline must bound.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ws.all_reduce(inp)
+
+    if rank != 0:
+        # Never enter the replay: rank 0's replay then waits for a peer that
+        # is gone, inside the captured graph, where no host code can run.
+        time.sleep(10 * _TIMEOUT_S)
+        os._exit(0)
+
+    start = time.monotonic()
+    try:
+        graph.replay()
+        torch.cuda.synchronize()
+    except RuntimeError:
+        # The trap poisons the CUDA context, so no teardown: exit directly.
+        os._exit(0 if time.monotonic() - start < 5 * _TIMEOUT_S else 2)
+    os._exit(1)  # returned although its peer never arrived
+
+
+@pytest.mark.node_exclusive
+def test_missing_peer_traps_instead_of_hanging_graph_replay() -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs 2 GPUs with CUDA IPC")
+    multi_process_parallel(2, _missing_peer_graph_worker, timeout_s=20 * _TIMEOUT_S)
